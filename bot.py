@@ -1,31 +1,43 @@
 import asyncio
+import json
 import logging
 import os
 import tempfile
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, Message
+from telethon import TelegramClient, events
+from telethon.tl.types import DocumentAttributeVideo
 
+# ---------- Настройки (переменные окружения) ----------
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = (
     os.environ.get("BOT_TOKEN")
     or os.environ.get("TELEGRAM_BOT_TOKEN")
     or os.environ.get("TOKEN")
 )
 if not BOT_TOKEN:
-    raise SystemExit("Не задан токен: добавьте переменную BOT_TOKEN")
+    raise SystemExit("Не задан BOT_TOKEN")
 
-# Лимит скачивания у обычного Bot API — 20 МБ.
-# Если поднимете локальный Bot API сервер, можно увеличить.
-MAX_INPUT_MB = 20
-MAX_DURATION_SEC = 180
+# Владельцы: расширенные лимиты. Можно задать OWNER_IDS="691338945,123"
+OWNER_IDS = {
+    int(x) for x in os.environ.get("OWNER_IDS", "691338945").split(",") if x.strip()
+}
 
-# Одновременно обрабатываем не больше N видео (ffmpeg тяжёлый)
-semaphore = asyncio.Semaphore(2)
+# Видео обрабатывается в оперативной памяти (/dev/shm), на диск не пишется.
+# Поэтому лимиты зависят от RAM вашего тарифа — настройте под себя.
+USER_MAX_MB = int(os.environ.get("USER_MAX_MB", "100"))
+USER_MAX_SEC = int(os.environ.get("USER_MAX_SEC", "180"))
+OWNER_MAX_MB = int(os.environ.get("OWNER_MAX_MB", "500"))
+OWNER_MAX_SEC = int(os.environ.get("OWNER_MAX_SEC", "3600"))
 
-# Фильтры: вертикаль 1080x1920 с размытым фоном, шумоподавление,
-# лёгкая резкость, контраст и насыщенность
+# Временная папка в RAM; если её нет — обычная временная папка
+TMP_BASE = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
+
+# Одновременно обрабатываем не больше N видео
+semaphore = asyncio.Semaphore(int(os.environ.get("MAX_JOBS", "2")))
+
+# Вертикаль 1080x1920 с размытым фоном, шумоподавление, резкость, цвет
 VIDEO_FILTER = (
     "split[a][b];"
     "[a]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,"
@@ -38,7 +50,8 @@ VIDEO_FILTER = (
     "format=yuv420p"
 )
 
-dp = Dispatcher()
+Path("data").mkdir(exist_ok=True)
+client = TelegramClient("data/bot", API_ID, API_HASH)
 
 
 async def enhance(src: Path, dst: Path) -> None:
@@ -63,56 +76,95 @@ async def enhance(src: Path, dst: Path) -> None:
         raise RuntimeError(err.decode(errors="ignore")[-500:])
 
 
-@dp.message(CommandStart())
-async def start(message: Message):
-    await message.answer(
+async def probe_duration(path: Path) -> int:
+    proc = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    try:
+        return int(float(json.loads(out)["format"]["duration"]))
+    except Exception:
+        return 0
+
+
+def is_video(event) -> bool:
+    if event.video:
+        return True
+    doc = event.document
+    return bool(doc and (doc.mime_type or "").startswith("video/"))
+
+
+@client.on(events.NewMessage(pattern="/start", incoming=True))
+async def start(event):
+    await event.respond(
         "Привет! Пришли видео — я подготовлю его для TikTok:\n"
         "• формат 1080×1920 (9:16)\n"
         "• шумоподавление и резкость\n"
         "• цвет и контраст\n"
         "• выровненная громкость\n\n"
-        f"Лимит: до {MAX_INPUT_MB} МБ и {MAX_DURATION_SEC} сек."
+        f"Лимит: до {USER_MAX_MB} МБ и {USER_MAX_SEC} сек."
     )
 
 
-@dp.message(F.video | F.document.mime_type.startswith("video/"))
-async def handle_video(message: Message, bot: Bot):
-    media = message.video or message.document
+@client.on(events.NewMessage(incoming=True, func=is_video))
+async def handle_video(event):
+    is_owner = event.sender_id in OWNER_IDS
+    max_mb = OWNER_MAX_MB if is_owner else USER_MAX_MB
+    max_sec = OWNER_MAX_SEC if is_owner else USER_MAX_SEC
 
-    if media.file_size and media.file_size > MAX_INPUT_MB * 1024 * 1024:
-        await message.answer(f"Файл больше {MAX_INPUT_MB} МБ, пришли поменьше.")
+    f = event.file
+    if f.size and f.size > max_mb * 1024 * 1024:
+        await event.reply(f"Файл больше {max_mb} МБ.")
         return
-    duration = getattr(media, "duration", None)
-    if duration and duration > MAX_DURATION_SEC:
-        await message.answer(f"Видео длиннее {MAX_DURATION_SEC} сек.")
+    if f.duration and f.duration > max_sec:
+        await event.reply(f"Видео длиннее {max_sec} сек.")
         return
 
-    status = await message.answer("⏳ Обрабатываю, это может занять минуту...")
+    status = await event.reply("⏳ Скачиваю видео...")
 
     async with semaphore:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=TMP_BASE) as tmp:
             src = Path(tmp) / "in.mp4"
             dst = Path(tmp) / "out.mp4"
             try:
-                await bot.download(media, destination=src)
-                await enhance(src, dst)
-                await message.answer_video(
-                    FSInputFile(dst),
-                    width=1080,
-                    height=1920,
-                    supports_streaming=True,
+                await event.download_media(file=str(src))
+                await status.edit("⚙️ Улучшаю качество, это может занять время...")
+                try:
+                    await enhance(src, dst)
+                finally:
+                    src.unlink(missing_ok=True)  # оригинал удаляем сразу
+
+                await status.edit("📤 Отправляю результат...")
+                duration = await probe_duration(dst)
+                await client.send_file(
+                    event.chat_id,
+                    str(dst),
                     caption="Готово ✅",
+                    reply_to=event.id,
+                    attributes=[
+                        DocumentAttributeVideo(
+                            duration=duration,
+                            w=1080,
+                            h=1920,
+                            supports_streaming=True,
+                        )
+                    ],
+                    supports_streaming=True,
                 )
+                dst.unlink(missing_ok=True)  # результат удаляем сразу после отправки
                 await status.delete()
             except Exception:
                 logging.exception("Ошибка обработки")
-                await status.edit_text("Не получилось обработать видео 😕")
+                await status.edit("Не получилось обработать видео 😕")
 
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    bot = Bot(BOT_TOKEN)
-    await dp.start_polling(bot)
+    await client.start(bot_token=BOT_TOKEN)
+    logging.info("Бот запущен")
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
