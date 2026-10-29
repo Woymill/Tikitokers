@@ -25,8 +25,8 @@ OWNER_IDS = {
     int(x) for x in os.environ.get("OWNER_IDS", "691338945").split(",") if x.strip()
 }
 
-# Видео обрабатывается в оперативной памяти (/dev/shm), на диск не пишется.
-# Поэтому лимиты зависят от RAM вашего тарифа — настройте под себя.
+# Видео хранится во временной папке только на время обработки и удаляется сразу.
+# Лимиты зависят от ресурсов вашего тарифа — настройте под себя.
 USER_MAX_MB = int(os.environ.get("USER_MAX_MB", "100"))
 USER_MAX_SEC = int(os.environ.get("USER_MAX_SEC", "180"))
 OWNER_MAX_MB = int(os.environ.get("OWNER_MAX_MB", "500"))
@@ -35,27 +35,30 @@ OWNER_MAX_SEC = int(os.environ.get("OWNER_MAX_SEC", "3600"))
 
 
 def pick_tmp(file_size: int):
-    """RAM (/dev/shm), если там хватает места, иначе обычный диск
-    (файлы всё равно удаляются сразу после обработки).
-    В Docker /dev/shm по умолчанию всего 64 МБ."""
-    try:
-        if os.access("/dev/shm", os.W_OK):
-            free = shutil.disk_usage("/dev/shm").free
-            if free > (file_size or 0) * 2 + 50 * 1024 * 1024:
-                return "/dev/shm"
-    except Exception:
-        pass
+    """По умолчанию — обычная временная папка (файлы удаляются сразу после
+    обработки). Если задать USE_RAM=1, используется /dev/shm (RAM), но только
+    когда там хватает места; в Docker он обычно всего 64 МБ, а память
+    контейнера ограничена."""
+    if os.environ.get("USE_RAM") == "1":
+        try:
+            if os.access("/dev/shm", os.W_OK):
+                free = shutil.disk_usage("/dev/shm").free
+                if free > (file_size or 0) * 2 + 50 * 1024 * 1024:
+                    return "/dev/shm"
+        except Exception:
+            pass
     return None
 
 # Одновременно обрабатываем не больше N видео
-semaphore = asyncio.Semaphore(int(os.environ.get("MAX_JOBS", "2")))
+semaphore = asyncio.Semaphore(int(os.environ.get("MAX_JOBS", "1")))
 
 # Вертикаль 1080x1920 с размытым фоном, шумоподавление, резкость, цвет
 VIDEO_FILTER = (
     "split[a][b];"
-    "[a]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,"
-    "crop=1080:1920,boxblur=25:5[bg];"
-    "[b]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos[fg];"
+    # фон: уменьшаем, размываем и растягиваем (дёшево по CPU и памяти)
+    "[a]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
+    "boxblur=8:2,scale=1080:1920[bg];"
+    "[b]scale=1080:1920:force_original_aspect_ratio=decrease:flags=bicubic[fg];"
     "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
     "hqdn3d=2:1.5:3:3,"
     "unsharp=5:5:0.8:5:5:0.0,"
@@ -74,6 +77,7 @@ def find_ffmpeg() -> str:
 
 
 FFMPEG = find_ffmpeg()
+FF_THREADS = os.environ.get("FF_THREADS", "2")
 
 Path("data").mkdir(exist_ok=True)
 client = TelegramClient("data/bot", API_ID, API_HASH)
@@ -81,10 +85,12 @@ client = TelegramClient("data/bot", API_ID, API_HASH)
 
 async def enhance(src: Path, dst: Path) -> None:
     cmd = [
-        FFMPEG, "-y", "-i", str(src),
+        FFMPEG, "-y", "-nostats", "-loglevel", "error",
+        "-threads", FF_THREADS, "-i", str(src),
         "-vf", VIDEO_FILTER,
         "-r", "30",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-threads", FF_THREADS,
         "-profile:v", "high", "-maxrate", "12M", "-bufsize", "24M",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
@@ -98,7 +104,9 @@ async def enhance(src: Path, dst: Path) -> None:
     )
     _, err = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(err.decode(errors="ignore")[-500:])
+        tail = err.decode(errors="ignore")[-400:].strip()
+        hint = " (процесс убит — вероятно, не хватило памяти)" if proc.returncode == -9 else ""
+        raise RuntimeError(f"ffmpeg код {proc.returncode}{hint}. {tail}")
 
 
 async def probe_duration(path: Path) -> int:
