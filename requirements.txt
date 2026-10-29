@@ -1,1 +1,2 @@
 telethon>=1.36
+imageio-ffmpeg>=0.5

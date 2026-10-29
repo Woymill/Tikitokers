@@ -1,7 +1,8 @@
 import asyncio
-import json
 import logging
 import os
+import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -31,8 +32,20 @@ USER_MAX_SEC = int(os.environ.get("USER_MAX_SEC", "180"))
 OWNER_MAX_MB = int(os.environ.get("OWNER_MAX_MB", "500"))
 OWNER_MAX_SEC = int(os.environ.get("OWNER_MAX_SEC", "3600"))
 
-# Временная папка в RAM; если её нет — обычная временная папка
-TMP_BASE = "/dev/shm" if os.access("/dev/shm", os.W_OK) else None
+
+
+def pick_tmp(file_size: int):
+    """RAM (/dev/shm), если там хватает места, иначе обычный диск
+    (файлы всё равно удаляются сразу после обработки).
+    В Docker /dev/shm по умолчанию всего 64 МБ."""
+    try:
+        if os.access("/dev/shm", os.W_OK):
+            free = shutil.disk_usage("/dev/shm").free
+            if free > (file_size or 0) * 2 + 50 * 1024 * 1024:
+                return "/dev/shm"
+    except Exception:
+        pass
+    return None
 
 # Одновременно обрабатываем не больше N видео
 semaphore = asyncio.Semaphore(int(os.environ.get("MAX_JOBS", "2")))
@@ -50,13 +63,25 @@ VIDEO_FILTER = (
     "format=yuv420p"
 )
 
+
+def find_ffmpeg() -> str:
+    """Системный ffmpeg, а если его нет — встроенный из пакета imageio-ffmpeg."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+FFMPEG = find_ffmpeg()
+
 Path("data").mkdir(exist_ok=True)
 client = TelegramClient("data/bot", API_ID, API_HASH)
 
 
 async def enhance(src: Path, dst: Path) -> None:
     cmd = [
-        "ffmpeg", "-y", "-i", str(src),
+        FFMPEG, "-y", "-i", str(src),
         "-vf", VIDEO_FILTER,
         "-r", "30",
         "-c:v", "libx264", "-preset", "medium", "-crf", "18",
@@ -78,15 +103,16 @@ async def enhance(src: Path, dst: Path) -> None:
 
 async def probe_duration(path: Path) -> int:
     proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        FFMPEG, "-i", str(path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
     )
-    out, _ = await proc.communicate()
-    try:
-        return int(float(json.loads(out)["format"]["duration"]))
-    except Exception:
+    _, err = await proc.communicate()
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", err.decode(errors="ignore"))
+    if not m:
         return 0
+    h, mi, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    return int(h * 3600 + mi * 60 + sec)
 
 
 def is_video(event) -> bool:
@@ -125,7 +151,7 @@ async def handle_video(event):
     status = await event.reply("⏳ Скачиваю видео...")
 
     async with semaphore:
-        with tempfile.TemporaryDirectory(dir=TMP_BASE) as tmp:
+        with tempfile.TemporaryDirectory(dir=pick_tmp(f.size)) as tmp:
             src = Path(tmp) / "in.mp4"
             dst = Path(tmp) / "out.mp4"
             try:
@@ -155,9 +181,12 @@ async def handle_video(event):
                 )
                 dst.unlink(missing_ok=True)  # результат удаляем сразу после отправки
                 await status.delete()
-            except Exception:
+            except Exception as e:
                 logging.exception("Ошибка обработки")
-                await status.edit("Не получилось обработать видео 😕")
+                text = "Не получилось обработать видео 😕"
+                if is_owner:  # владельцу показываем причину
+                    text += f"\n\n{type(e).__name__}: {str(e)[-400:]}"
+                await status.edit(text)
 
 
 async def main():
